@@ -226,7 +226,7 @@ async def get_conversations(db: Session = Depends(get_db)):
         logger.error(f"Error fetching conversations: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/conversations/{conversation_id}/messages", response_model=List[MessageHistoryResponse])
+@app.get("/{conversation_id}/messages", response_model=List[MessageHistoryResponse])
 async def get_conversation_messages(
     conversation_id: str,
     db: Session = Depends(get_db)
@@ -249,7 +249,7 @@ async def get_conversation_messages(
         logger.error(f"Error fetching messages: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/conversations/{conversation_id}")
+@app.delete("/{conversation_id}")
 async def delete_conversation(
     conversation_id: str,
     db: Session = Depends(get_db)
