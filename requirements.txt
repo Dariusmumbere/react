@@ -6,3 +6,7 @@ sqlalchemy
 asyncpg
 psycopg2-binary
 pydantic
+requests
+passlib[bcrypt]
+python-jose[cryptography]
+
