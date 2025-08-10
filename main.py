@@ -5,10 +5,11 @@ from pydantic import BaseModel
 from typing import List, Optional
 import google.generativeai as genai
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, desc
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import logging
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,8 +18,8 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI
 app = FastAPI(
     title="Gemini Chatbot API",
-    description="API for the Gemini-powered chatbot",
-    version="0.1.0",
+    description="API for the Gemini-powered chatbot with conversation history",
+    version="0.2.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -32,8 +33,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database configuration - Using your Render PostgreSQL URL
-DATABASE_URL = "postgresql://react_8z5x_user:sZUPOWsl2ChU2DmNGi572dEGdcW7D6DU@dpg-d2cd3madbo4c73bknvkg-a/react_8z5x"
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://react_8z5x_user:sZUPOWsl2ChU2DmNGi572dEGdcW7D6DU@dpg-d2cd3madbo4c73bknvkg-a/react_8z5x")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -68,8 +69,8 @@ def get_db():
     finally:
         db.close()
 
-# Gemini configuration - Using your API key
-GEMINI_API_KEY = "AIzaSyBIZbO5KawONRW9-JCBoIQ7vX5EhSKFhNM"
+# Gemini configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBIZbO5KawONRW9-JCBoIQ7vX5EhSKFhNM")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
@@ -87,12 +88,30 @@ class ConversationResponse(BaseModel):
     title: str
     created_at: datetime
     updated_at: datetime
+    preview: Optional[str] = None  # Last message preview
 
 class MessageHistoryResponse(BaseModel):
     id: str
     content: str
     sender: str
     timestamp: datetime
+
+# Helper functions
+def generate_conversation_id():
+    return f"conv-{uuid.uuid4()}"
+
+def generate_message_id():
+    return f"msg-{uuid.uuid4()}"
+
+def generate_conversation_title(first_message: str, model) -> str:
+    try:
+        prompt = f"""Generate a very short (2-4 word) title for a conversation that starts with: 
+        "{first_message}". Return only the title, no quotes or additional text."""
+        response = model.generate_content(prompt)
+        return response.text.strip('"\'')
+    except Exception as e:
+        logger.warning(f"Failed to generate title: {e}")
+        return first_message[:30] + "..." if len(first_message) > 30 else first_message
 
 # API endpoints
 @app.post("/chat", response_model=MessageResponse)
@@ -102,11 +121,11 @@ async def chat_with_gemini(
 ):
     try:
         # Start or continue conversation
-        conversation_id = request.conversation_id or f"conv-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+        conversation_id = request.conversation_id or generate_conversation_id()
         
         # Save user message to database
         user_message = Message(
-            id=f"msg-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
+            id=generate_message_id(),
             conversation_id=conversation_id,
             content=request.message,
             sender="user",
@@ -115,10 +134,10 @@ async def chat_with_gemini(
         db.add(user_message)
         db.commit()
         
-        # Get conversation history for context
+        # Get conversation history for context (last 10 messages)
         history = db.query(Message).filter(
             Message.conversation_id == conversation_id
-        ).order_by(Message.timestamp.asc()).all()
+        ).order_by(Message.timestamp.asc()).limit(10).all()
         
         # Format chat history for Gemini
         chat_history = []
@@ -141,7 +160,7 @@ async def chat_with_gemini(
         
         # Save assistant message to database
         assistant_message = Message(
-            id=f"msg-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
+            id=generate_message_id(),
             conversation_id=conversation_id,
             content=response_text,
             sender="assistant",
@@ -149,14 +168,9 @@ async def chat_with_gemini(
         )
         db.add(assistant_message)
         
-        # Update conversation title if it's the first message
+        # Create new conversation if needed
         if not request.conversation_id:
-            # Generate a title based on the first message
-            title_response = model.generate_content(
-                f"Generate a very short (2-4 word) title for a conversation that starts with: {request.message}"
-            )
-            title = title_response.text.strip('"\'')
-            
+            title = generate_conversation_title(request.message, model)
             conversation = Conversation(
                 id=conversation_id,
                 title=title,
@@ -164,6 +178,11 @@ async def chat_with_gemini(
                 updated_at=datetime.utcnow()
             )
             db.add(conversation)
+        else:
+            # Update conversation timestamp
+            db.query(Conversation).filter(
+                Conversation.id == conversation_id
+            ).update({"updated_at": datetime.utcnow()})
         
         db.commit()
         
@@ -179,18 +198,79 @@ async def chat_with_gemini(
 
 @app.get("/conversations", response_model=List[ConversationResponse])
 async def get_conversations(db: Session = Depends(get_db)):
-    conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).all()
-    return conversations
+    try:
+        # Get conversations with their last message for preview
+        conversations = db.query(Conversation).order_by(desc(Conversation.updated_at)).all()
+        
+        # Get last message for each conversation
+        conversation_responses = []
+        for conv in conversations:
+            last_message = db.query(Message).filter(
+                Message.conversation_id == conv.id
+            ).order_by(desc(Message.timestamp)).first()
+            
+            preview = last_message.content[:50] + "..." if last_message and len(last_message.content) > 50 else (
+                last_message.content if last_message else None
+            )
+            
+            conversation_responses.append(ConversationResponse(
+                id=conv.id,
+                title=conv.title,
+                created_at=conv.created_at,
+                updated_at=conv.updated_at,
+                preview=preview
+            ))
+        
+        return conversation_responses
+    except Exception as e:
+        logger.error(f"Error fetching conversations: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/conversations/{conversation_id}/messages", response_model=List[MessageHistoryResponse])
 async def get_conversation_messages(
     conversation_id: str,
     db: Session = Depends(get_db)
 ):
-    messages = db.query(Message).filter(
-        Message.conversation_id == conversation_id
-    ).order_by(Message.timestamp.asc()).all()
-    return messages
+    try:
+        # Verify conversation exists
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).first()
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        messages = db.query(Message).filter(
+            Message.conversation_id == conversation_id
+        ).order_by(Message.timestamp.asc()).all()
+        
+        return messages
+    except Exception as e:
+        logger.error(f"Error fetching messages: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    db: Session = Depends(get_db)
+):
+    try:
+        # Delete messages first
+        db.query(Message).filter(
+            Message.conversation_id == conversation_id
+        ).delete()
+        
+        # Then delete conversation
+        db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).delete()
+        
+        db.commit()
+        return {"status": "success", "message": "Conversation deleted"}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting conversation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
