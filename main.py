@@ -71,7 +71,7 @@ def get_db():
 # Gemini configuration - Using your API key
 GEMINI_API_KEY = "AIzaSyBIZbO5KawONRW9-JCBoIQ7vX5EhSKFhNM"
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # Pydantic models
 class MessageRequest(BaseModel):
