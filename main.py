@@ -1,23 +1,15 @@
 import os
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional
 import google.generativeai as genai
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, desc, ForeignKey
+from datetime import datetime
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, desc
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.orm import sessionmaker, Session
 import logging
 import uuid
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-import requests
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +18,8 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI
 app = FastAPI(
     title="Gemini Chatbot API",
-    description="API for the Gemini-powered chatbot with conversation history and authentication",
-    version="0.3.0",
+    description="API for the Gemini-powered chatbot with conversation history",
+    version="0.2.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -48,26 +40,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
-# Security configuration
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
-
 # Database models
-class User(Base):
-    __tablename__ = "users"
-    
-    id = Column(String, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True)
-    name = Column(String)
-    hashed_password = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    conversations = relationship("Conversation", back_populates="user")
-
 class Conversation(Base):
     __tablename__ = "conversations"
     
@@ -75,47 +48,33 @@ class Conversation(Base):
     title = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    user_id = Column(String, ForeignKey("users.id"))
-    
-    user = relationship("User", back_populates="conversations")
-    messages = relationship("Message", back_populates="conversation")
 
 class Message(Base):
     __tablename__ = "messages"
     
     id = Column(String, primary_key=True, index=True)
-    conversation_id = Column(String, ForeignKey("conversations.id"))
+    conversation_id = Column(String, index=True)
     content = Column(Text)
     sender = Column(String)  # 'user' or 'assistant'
     timestamp = Column(DateTime, default=datetime.utcnow)
-    
-    conversation = relationship("Conversation", back_populates="messages")
 
 # Create tables
 Base.metadata.create_all(bind=engine)
 
+# Dependency to get DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Gemini configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBIZbO5KawONRW9-JCBoIQ7vX5EhSKFhNM")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-2.5-flash')
+
 # Pydantic models
-class UserBase(BaseModel):
-    email: str
-    name: Optional[str] = None
-
-class UserCreate(UserBase):
-    password: str
-
-class UserInDB(UserBase):
-    id: str
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class TokenData(BaseModel):
-    email: Optional[str] = None
-
 class MessageRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
@@ -129,7 +88,7 @@ class ConversationResponse(BaseModel):
     title: str
     created_at: datetime
     updated_at: datetime
-    preview: Optional[str] = None
+    preview: Optional[str] = None  # Last message preview
 
 class MessageHistoryResponse(BaseModel):
     id: str
@@ -137,55 +96,7 @@ class MessageHistoryResponse(BaseModel):
     sender: str
     timestamp: datetime
 
-class GoogleAuthRequest(BaseModel):
-    token: str
-    email: str
-    name: str
-
 # Helper functions
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-        token_data = TokenData(email=email)
-    except JWTError:
-        raise credentials_exception
-    
-    user = db.query(User).filter(User.email == token_data.email).first()
-    if user is None:
-        raise credentials_exception
-    return user
-
 def generate_conversation_id():
     return f"conv-{uuid.uuid4()}"
 
@@ -202,113 +113,10 @@ def generate_conversation_title(first_message: str, model) -> str:
         logger.warning(f"Failed to generate title: {e}")
         return first_message[:30] + "..." if len(first_message) > 30 else first_message
 
-# Gemini configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBIZbO5KawONRW9-JCBoIQ7vX5EhSKFhNM")
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash')
-
-# Authentication endpoints
-@app.post("/auth/signup", response_model=Token)
-async def signup(user_data: UserCreate, db: Session = Depends(get_db)):
-    # Check if user already exists
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Create new user
-    hashed_password = get_password_hash(user_data.password)
-    user_id = f"user-{uuid.uuid4()}"
-    new_user = User(
-        id=user_id,
-        email=user_data.email,
-        name=user_data.name,
-        hashed_password=hashed_password,
-        created_at=datetime.utcnow()
-    )
-    
-    db.add(new_user)
-    db.commit()
-    
-    # Generate token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user_data.email}, expires_delta=access_token_expires
-    )
-    
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/auth/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
-    )
-    
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/auth/google", response_model=Token)
-async def google_auth(google_data: GoogleAuthRequest, db: Session = Depends(get_db)):
-    try:
-        # Verify Google token
-        google_response = requests.get(
-            f"https://www.googleapis.com/oauth2/v3/tokeninfo?access_token={google_data.token}"
-        )
-        google_response.raise_for_status()
-        token_info = google_response.json()
-        
-        if token_info.get("email") != google_data.email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid Google token"
-            )
-        
-        # Check if user exists
-        user = db.query(User).filter(User.email == google_data.email).first()
-        
-        if not user:
-            # Create new user
-            user_id = f"user-{uuid.uuid4()}"
-            new_user = User(
-                id=user_id,
-                email=google_data.email,
-                name=google_data.name,
-                hashed_password=get_password_hash(str(uuid.uuid4())),  # Random password for Google users
-                created_at=datetime.utcnow()
-            )
-            db.add(new_user)
-            db.commit()
-            user = new_user
-        
-        # Generate token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.email}, expires_delta=access_token_expires
-        )
-        
-        return {"access_token": access_token, "token_type": "bearer"}
-    
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Google token"
-        )
-
 # API endpoints
 @app.post("/chat", response_model=MessageResponse)
 async def chat_with_gemini(
     request: MessageRequest,
-    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -367,8 +175,7 @@ async def chat_with_gemini(
                 id=conversation_id,
                 title=title,
                 created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-                user_id=current_user.id
+                updated_at=datetime.utcnow()
             )
             db.add(conversation)
         else:
@@ -390,15 +197,10 @@ async def chat_with_gemini(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/conversations", response_model=List[ConversationResponse])
-async def get_conversations(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
+async def get_conversations(db: Session = Depends(get_db)):
     try:
         # Get conversations with their last message for preview
-        conversations = db.query(Conversation).filter(
-            Conversation.user_id == current_user.id
-        ).order_by(desc(Conversation.updated_at)).all()
+        conversations = db.query(Conversation).order_by(desc(Conversation.updated_at)).all()
         
         # Get last message for each conversation
         conversation_responses = []
@@ -427,14 +229,12 @@ async def get_conversations(
 @app.get("/{conversation_id}/messages", response_model=List[MessageHistoryResponse])
 async def get_conversation_messages(
     conversation_id: str,
-    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
-        # Verify conversation exists and belongs to user
+        # Verify conversation exists
         conversation = db.query(Conversation).filter(
-            Conversation.id == conversation_id,
-            Conversation.user_id == current_user.id
+            Conversation.id == conversation_id
         ).first()
         
         if not conversation:
@@ -452,19 +252,9 @@ async def get_conversation_messages(
 @app.delete("/{conversation_id}")
 async def delete_conversation(
     conversation_id: str,
-    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
-        # Verify conversation belongs to user
-        conversation = db.query(Conversation).filter(
-            Conversation.id == conversation_id,
-            Conversation.user_id == current_user.id
-        ).first()
-        
-        if not conversation:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        
         # Delete messages first
         db.query(Message).filter(
             Message.conversation_id == conversation_id
